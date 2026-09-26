@@ -42,7 +42,7 @@ jobs:
           echo "$result" > /tmp/omi-18945-proof/baseline.exit
           cat /tmp/omi-18945-proof/baseline.log
           exit 0
-      - name: Isolate the unrelated account-deletion import in the new fixture
+      - name: Isolate unused metrics-registering imports in the new fixture
         working-directory: backend
         run: |
           .venv/bin/python - <<'PY'
@@ -52,14 +52,17 @@ jobs:
           source = p.read_text()
           anchor = '        "database.firestore_cache": _module(\n'
           assert source.count(anchor) == 1
-          insertion = '''        # These settings tests never invoke account-deletion behavior. Keep its
-                  # metrics-registering import out of the restoring module sandbox.
+          insertion = '''        # These settings tests do not exercise deletion or typed read boundaries.
+                  # Their imports register global metrics that outlive the module sandbox.
                   "database.account_deletion_marker": _module(
                       "database.account_deletion_marker",
                       account_deletion_collection=MagicMock(),
                       account_deletion_document=MagicMock(),
                       account_deletion_firestore_client=MagicMock(),
                       get_user_deletion_wipe_status=MagicMock(),
+                  ),
+                  "database.read_boundary": _module(
+                      "database.read_boundary", parse_snapshot_or_none=MagicMock(), parse_snapshot_strict=MagicMock()
                   ),
           '''
           p.write_text(source.replace(anchor, insertion + anchor))
