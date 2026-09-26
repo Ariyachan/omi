@@ -96,10 +96,6 @@ jobs:
               ref.update.assert_called_once()
               ref.set.assert_not_called()
           '''
-          import textwrap
-          marker = '\n\n          @pytest.mark.parametrize'
-          start = tests.index(marker)
-          tests = tests[:start] + '\n\n' + textwrap.dedent(tests[start:]).lstrip('\n')
           test_path.write_text(tests)
           compile(source, str(source_path), 'exec')
           compile(tests, str(test_path), 'exec')
