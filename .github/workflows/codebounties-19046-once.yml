@@ -1,0 +1,94 @@
+name: CodeBounties 19046 one-off verification
+
+on:
+  push:
+    branches: ['verify/19046-model-roundtrip-20260926']
+    paths: ['.github/workflows/codebounties-19046-once.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: github.repository == 'Ariyachan/omi'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: backend/.python-version
+      - uses: astral-sh/setup-uv@ecd24dd710f2fb0dca1693a67af11fc4a5c5ec84
+        with:
+          enable-cache: false
+      - name: Install the project lock without changing dependency versions
+        working-directory: backend
+        run: |
+          uv venv .venv
+          uv pip sync pylock.toml --python .venv/bin/python
+          .venv/bin/python --version
+          .venv/bin/python -c "import importlib.metadata as m; print({n:m.version(n) for n in ['pytest','pydantic','google-cloud-firestore']})"
+      - name: Run focused production-reader and model tests
+        working-directory: backend
+        run: |
+          mkdir -p /tmp/omi-19046-proof
+          git rev-parse HEAD | tee /tmp/omi-19046-proof/revision.txt
+          git hash-object database/tasks.py models/task.py tests/unit/test_database_tasks_model_roundtrip.py
+          .venv/bin/python -m pytest tests/unit/test_database_tasks_resilience.py tests/unit/test_database_tasks_model_roundtrip.py -q --junitxml=/tmp/omi-19046-proof/current.xml
+      - name: Verify the regression fails against the pre-fix reader
+        working-directory: backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'git restore -- database/tasks.py' EXIT
+          git show eb78646588a59af7e870159ede66b20e25a2e188:backend/database/tasks.py > database/tasks.py
+          set +e
+          .venv/bin/python -m pytest tests/unit/test_database_tasks_model_roundtrip.py -q --junitxml=/tmp/omi-19046-proof/baseline.xml
+          result=$?
+          set -e
+          test "$result" -eq 1
+          .venv/bin/python - <<'PY'
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('/tmp/omi-19046-proof/baseline.xml')
+          cases = list(tree.iter('testcase'))
+          failures = [(case, case.find('failure')) for case in cases if case.find('failure') is not None]
+          assert len(cases) == 2 and len(failures) == 1
+          case, failure = failures[0]
+          assert '[None]' in case.attrib['name']
+          assert 'ValidationError' in (failure.text or '') and 'Field required' in (failure.text or '')
+          assert not list(tree.iter('error'))
+          print('Expected control confirmed: missing Task.id fails only on the pre-fix reader.')
+          PY
+      - name: Check the real pinned Firestore serialization semantics without RPC
+        working-directory: backend
+        run: |
+          .venv/bin/python - <<'PY'
+          import importlib.metadata
+          from google.cloud.firestore_v1 import _helpers, DELETE_FIELD
+          path = 'projects/test/databases/(default)/documents/tasks/example'
+          [updated] = _helpers.pbs_for_update(path, {'x': None}, None)
+          [merged] = _helpers.pbs_for_set_with_merge(path, {'x': None}, True)
+          [deleted] = _helpers.pbs_for_update(path, {'x': DELETE_FIELD}, None)
+          assert updated.update.fields['x']._pb.WhichOneof('value_type') == 'null_value'
+          assert merged.update.fields['x']._pb.WhichOneof('value_type') == 'null_value'
+          assert 'x' not in deleted.update.fields and 'x' in deleted.update_mask.field_paths
+          [nested] = _helpers.pbs_for_update(path, {'integration.enabled': True}, None)
+          [literal] = _helpers.pbs_for_set_with_merge(path, {'integration.enabled': True}, True)
+          assert 'integration.enabled' in nested.update_mask.field_paths
+          assert '`integration.enabled`' in literal.update_mask.field_paths
+          print('Firestore', importlib.metadata.version('google-cloud-firestore'), ': five null/delete/field-path assertions passed without network calls.')
+          PY
+      - name: Confirm production files were not changed
+        run: git diff --exit-code -- backend/database/tasks.py backend/models/task.py
+      - name: Preserve focused test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: omi-19046-model-proof
+          path: /tmp/omi-19046-proof
+          retention-days: 2
+          if-no-files-found: ignore
